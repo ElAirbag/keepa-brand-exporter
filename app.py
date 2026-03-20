@@ -19,12 +19,12 @@ from datetime import datetime
 # ─────────────────────────────────────────────
 
 MARKETPLACES = {
-    "Amazon.de (Germany)":  3,
-    "Amazon.com (US)":      1,
-    "Amazon.co.uk (UK)":    2,
-    "Amazon.fr (France)":   4,
-    "Amazon.it (Italy)":    9,
-    "Amazon.es (Spain)":    10,
+    "Amazon.de (Germany)":  "DE",
+    "Amazon.com (US)":      "US",
+    "Amazon.co.uk (UK)":    "GB",
+    "Amazon.fr (France)":   "FR",
+    "Amazon.it (Italy)":    "IT",
+    "Amazon.es (Spain)":    "ES",
 }
 
 BATCH_SIZE   = 100   # ASINs per Keepa product query
@@ -53,25 +53,25 @@ def get_keepa_api(api_key):
     return keepa.Keepa(api_key)
 
 
-def fetch_asins_for_brand(api, brand: str, bsr_limit: int, domain: int) -> list[str]:
+def fetch_asins_for_brand(api, brand: str, bsr_limit: int, domain: str) -> list[str]:
     """
     Use Keepa Product Finder to get all ASINs for the brand
-    with current BSR <= bsr_limit.
+    with current BSR ≤ bsr_limit.
     Returns a list of ASIN strings.
     """
     product_parm = {
-        "brand":          [brand],
-        "salesRank_lte":  bsr_limit,
-        "domain":         domain,
+        "brand":              [brand],
+        "current_SALES_lte":  bsr_limit,   # renamed from salesRank_lte in keepa >= 1.4
     }
-    asins = api.product_finder(product_parm)
+    # domain is a string ('DE', 'US', …) passed as a separate kwarg — not in product_parm
+    asins = api.product_finder(product_parm, domain=domain, n_products=5000)
     return asins if asins is not None else []
 
 
 def build_category_path(category_tree: list) -> str:
     """
     Convert Keepa's categoryTree list of dicts to a slash-separated path string.
-    e.g. "Kueche, Haushalt & Wohnen / Kategorien / Kueche, Kochen & Backen / ..."
+    e.g. "Küche, Haushalt & Wohnen / Kategorien / Küche, Kochen & Backen / ..."
     The pipeline's parse_category_paths() will handle this fine.
     """
     if not category_tree:
@@ -79,7 +79,7 @@ def build_category_path(category_tree: list) -> str:
     return " / ".join(node.get("name", "") for node in category_tree)
 
 
-def fetch_product_details(api, asins: list, domain: int,
+def fetch_product_details(api, asins: list, domain: str,
                            progress_bar, status_text) -> pd.DataFrame:
     """
     Fetch product metadata for a list of ASINs in batches.
@@ -93,7 +93,7 @@ def fetch_product_details(api, asins: list, domain: int,
         pct = batch_idx / len(batches)
         progress_bar.progress(pct)
         status_text.text(
-            f"Fetching product data... batch {batch_idx + 1}/{len(batches)} "
+            f"Fetching product data… batch {batch_idx + 1}/{len(batches)} "
             f"({batch_idx * BATCH_SIZE}/{total} ASINs)"
         )
 
@@ -101,7 +101,7 @@ def fetch_product_details(api, asins: list, domain: int,
             products = api.query(
                 batch,
                 domain=domain,
-                history=False,
+                history=False,      # no price/BSR history — keeps token cost minimal
                 buybox=False,
             )
         except Exception as e:
@@ -112,16 +112,23 @@ def fetch_product_details(api, asins: list, domain: int,
             continue
 
         for p in products:
+            # Category: use the primary categoryTree path
             cat_tree  = p.get("categoryTree") or []
             cat_path  = build_category_path(cat_tree)
+
+            # Also collect all category IDs as secondary reference
             all_cat_ids = p.get("categories") or []
 
+            # Current BSR (stats.current[3] in Keepa convention, or use csv if available)
             stats        = p.get("stats") or {}
             current_vals = stats.get("current") or []
+            # Keepa stats.current indices: 0=Buy Box, 1=Amazon, 2=Marketplace new,
+            # 3=Sales Rank, 4=Marketplace used, ... (may vary by marketplace)
             bsr = None
             if len(current_vals) > 3 and current_vals[3] is not None and current_vals[3] != -1:
                 bsr = current_vals[3]
 
+            # Price: Buy Box price (index 0), in cents → convert to €
             price = None
             if len(current_vals) > 0 and current_vals[0] is not None and current_vals[0] != -1:
                 price = current_vals[0] / 100.0
@@ -138,7 +145,7 @@ def fetch_product_details(api, asins: list, domain: int,
             })
 
     progress_bar.progress(1.0)
-    status_text.text(f"Done - {len(rows)} products fetched.")
+    status_text.text(f"Done — {len(rows)} products fetched.")
     return pd.DataFrame(rows)
 
 
@@ -153,6 +160,7 @@ def main():
         layout="centered",
     )
 
+    # ── Header ──────────────────────────────
     st.markdown("""
         <div style="display:flex; justify-content:space-between; align-items:center;
                     border-bottom:3px solid #1A1A2E; padding-bottom:10px; margin-bottom:20px">
@@ -169,6 +177,7 @@ def main():
         </div>
     """, unsafe_allow_html=True)
 
+    # ── API Key ──────────────────────────────
     api_key = get_api_key()
     if not api_key:
         api_key = st.text_input(
@@ -182,6 +191,7 @@ def main():
         st.info("Enter your Keepa API key above to get started.")
         st.stop()
 
+    # ── Parameters ───────────────────────────
     col1, col2 = st.columns([2, 1])
     with col1:
         brand = st.text_input(
@@ -200,7 +210,7 @@ def main():
             max_value=1_000_000,
             value=200_000,
             step=10_000,
-            help="Only include products ranked better than this.",
+            help="Only include products ranked better than this. Lower = fewer but more relevant products.",
         )
     with col4:
         max_asins = st.number_input(
@@ -214,6 +224,7 @@ def main():
 
     domain = MARKETPLACES[marketplace_label]
 
+    # ── Token check ──────────────────────────
     if st.button("Check remaining tokens"):
         try:
             api = get_keepa_api(api_key)
@@ -224,22 +235,24 @@ def main():
 
     st.divider()
 
+    # ── Fetch ─────────────────────────────────
     if not brand:
         st.warning("Enter a brand name to continue.")
         st.stop()
 
     if st.button(f"🔍 Fetch '{brand}' from {marketplace_label}", type="primary"):
-        with st.spinner("Connecting to Keepa API..."):
+        with st.spinner("Connecting to Keepa API…"):
             try:
                 api = get_keepa_api(api_key)
             except Exception as e:
                 st.error(f"Could not connect to Keepa API: {e}")
                 st.stop()
 
-        st.markdown("**Step 1 — Finding ASINs...**")
+        # Step 1: product finder
+        st.markdown("**Step 1 — Finding ASINs…**")
         finder_bar  = st.progress(0.0)
         finder_text = st.empty()
-        finder_text.text("Running Product Finder...")
+        finder_text.text("Running Product Finder…")
 
         try:
             asins = fetch_asins_for_brand(api, brand, int(bsr_limit), domain)
@@ -251,24 +264,28 @@ def main():
 
         if not asins:
             st.warning(
-                f"No ASINs found for brand **'{brand}'** with BSR <= {bsr_limit:,} "
+                f"No ASINs found for brand **'{brand}'** with BSR ≤ {bsr_limit:,} "
                 f"on {marketplace_label}. "
-                "Try adjusting the brand name or increasing the BSR limit."
+                "Try adjusting the brand name (check exact spelling on Amazon) or increasing the BSR limit."
             )
             st.stop()
 
+        # Apply cap
         if len(asins) > max_asins:
             st.warning(
                 f"Found **{len(asins):,}** ASINs — capping at **{max_asins:,}** "
-                f"to control token cost."
+                f"to control token cost. Increase the cap if you need all of them."
             )
             asins = asins[:max_asins]
 
         finder_text.text(f"✅ Found {len(asins):,} ASINs")
-        est_tokens = len(asins) + 50
+
+        # Estimated token cost
+        est_tokens = len(asins) + 50   # 1/product + ~50 for finder
         st.caption(f"Estimated token cost: ~{est_tokens:,} tokens")
 
-        st.markdown("**Step 2 — Fetching product details...**")
+        # Step 2: product details
+        st.markdown("**Step 2 — Fetching product details…**")
         detail_bar  = st.progress(0.0)
         detail_text = st.empty()
 
@@ -282,8 +299,10 @@ def main():
             st.error("No product data returned. Check API key permissions.")
             st.stop()
 
+        # ── Results ───────────────────────────
         st.success(f"✅ Exported **{len(df):,} ASINs** for brand **{brand}**")
 
+        # Preview
         st.markdown("**Preview (first 20 rows)**")
         st.dataframe(
             df[["ASIN", "Parent_ASIN", "Brand", "Title", "BSR", "Price", "Category"]]
@@ -291,14 +310,17 @@ def main():
             use_container_width=True,
         )
 
+        # Stats
         col_a, col_b, col_c = st.columns(3)
         col_a.metric("Total ASINs",    f"{len(df):,}")
         col_b.metric("Unique Parents", f"{df['Parent_ASIN'].nunique():,}")
         col_c.metric("Avg Price",
                      f"€{df['Price'].dropna().mean():.2f}" if not df['Price'].dropna().empty else "n/a")
 
+        # Top categories
         if df["Category"].notna().any():
             st.markdown("**Top Categories (by ASIN count)**")
+            # Extract leaf-level segment for readability
             df["_leaf"] = df["Category"].apply(
                 lambda x: x.split(" / ")[-1].strip() if isinstance(x, str) and x else "Unknown"
             )
@@ -307,6 +329,7 @@ def main():
             st.dataframe(top_cats, use_container_width=True, hide_index=True)
             df.drop(columns=["_leaf"], inplace=True)
 
+        # Download
         ts       = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"keepa_{brand.lower().replace(' ', '_')}_{marketplace_label[:2].lower()}_{ts}.csv"
 
@@ -322,10 +345,11 @@ def main():
         )
 
         st.caption(
-            "Place this CSV anywhere and pass it via --keepa path/to/file.csv "
+            "Place this CSV anywhere and pass it via `--keepa path/to/file.csv` "
             "when running pipeline.py."
         )
 
+        # Remaining tokens
         try:
             tokens_left = api.tokens_left
             st.info(f"🪙 Keepa tokens remaining after export: **{tokens_left:,}**")
